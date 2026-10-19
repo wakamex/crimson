@@ -464,6 +464,16 @@ on the same frames (a run's seed still differs)
 device and nothing else: the game still mixes its sounds and music, so a muted
 run plays the same game ([`client/audio.cpp`](client/audio.cpp)).
 
+For streams and spectators, three settings make a busy screen easier to read
+at a glance; each changes only the picture and is off unless set.
+`CRIMSON_FLOOR=0.8,0.85` keeps 80% of the floor's brightness and 85% of its
+color, so blood and bodies sink back. `CRIMSON_OUTLINE=1,0.15,0.15,0.7` draws a
+thin red line around the enemies still standing, and
+`CRIMSON_PLAYER_OUTLINE=1,1,1,1.5` a white one around the players (color 0 to
+1, then the width in pixels). With none set, captured frames are identical to
+the renderer's without them. The browser build leaves them off
+([`client/renderer.cpp`](client/renderer.cpp)).
+
 `--watch` accepts a run id or a service link such as
 `https://crimson.land/play/?watch=<run-id>`; links must name the configured
 leaderboard's origin. The replay downloads while startup runs, then opens in

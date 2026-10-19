@@ -2,6 +2,19 @@
 // (OpenGL ES 3.0 / WebGL2 in the browser). Render targets and the back buffer
 // are framebuffer textures whose row 0 is the image's top row, as uploaded
 // textures are; presenting flips the back buffer into the window.
+//
+// Three settings make a busy screen easier to read at a glance, for streams and
+// spectators. Each changes only the picture and is off unless set:
+// CRIMSON_FLOOR=BRIGHTNESS,SATURATION keeps that share of the floor's brightness
+// and color wherever the terrain texture, into which the game paints blood and
+// bodies, is drawn on screen ("0.8,0.85"); CRIMSON_OUTLINE=R,G,B,WIDTH draws a
+// line of that color (0 to 1), WIDTH pixels wide, around the enemies still
+// standing ("1,0.15,0.15,0.7"), and CRIMSON_PLAYER_OUTLINE=R,G,B,WIDTH one
+// around the players ("1,1,1,1.5"). The enemies' and the players' draws are told
+// by their sprite sheets, recognized by a hash of their texels as the game
+// uploads them. As they are drawn they also go into a mask beside the back
+// buffer, and whatever is drawn over them takes them out of it again; once the
+// frame is drawn, one pass puts the lines on the pixels just outside the mask.
 #include "client.h"
 #include <math.h>
 #include <stdio.h>
@@ -63,7 +76,20 @@ GLuint program, present_program, vertex_array, vertex_buffer, index_buffer, samp
 // needs a complete texture behind it.
 GLuint blank_texture;
 GLint u_target_size, u_has_texture, u_color_op, u_color_arg1, u_color_arg2, u_alpha_op, u_alpha_arg1, u_alpha_arg2,
-    u_factor, u_alpha_test, u_alpha_ref, u_alpha_func;
+    u_factor, u_alpha_test, u_alpha_ref, u_alpha_func, u_floor, u_outlined;
+
+// The settings for streams and spectators (see the top of the file).
+float floor_grade[3], outline[2][4]; // on, brightness, saturation; color and width for enemies, then players
+enum { NOT_OUTLINED, ENEMY, PLAYER };
+// FNV-1a of the texels of trooper.jaz (the players), zombie.jaz, spider_sp1.jaz,
+// spider_sp2.jaz, alien.jaz and lizard.jaz in 1.9.93's crimson.paq.
+const struct { unsigned long long hash; int kind; } outlined_sheets[] = {
+    {0x13921a89cad4f5f3, PLAYER}, {0x490056f15f44ab64, ENEMY}, {0x6df9093d048def15, ENEMY},
+    {0x833a0d60de7fbeec, ENEMY},  {0x973bdf2adee71794, ENEMY}, {0xad9d405917df7523, ENEMY}};
+std::unordered_map<int, int> outlined_textures; // texture id: what it draws
+GLuint edge_program, mask_texture;
+bool edged; // this frame's lines are drawn
+const GLenum both_buffers[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
 
 const char *vertex_source = SHADER_HEADER R"(
 layout(location = 0) in vec4 position; // x, y, z, rhw in pixels
@@ -84,12 +110,15 @@ void main() {
 const char *fragment_source = SHADER_HEADER R"(
 in vec4 v_diffuse;
 in vec2 v_uv;
-out vec4 color;
+layout(location = 0) out vec4 color;
+layout(location = 1) out vec4 mask; // the outlined pixels: enemies in red, players in green, by their opacity
 uniform sampler2D texture0, texture1;
 uniform int has_texture[2], color_op[2], color_arg1[2], color_arg2[2], alpha_op[2], alpha_arg1[2], alpha_arg2[2];
 uniform vec4 factor;
 uniform int alpha_test, alpha_func;
 uniform float alpha_ref;
+uniform vec3 floor_grade; // on, brightness, saturation
+uniform int outlined; // what the draw is, for the mask: 1 an enemy, 2 a player
 vec4 argument(int a, vec4 current, vec4 texel) {
   int which = a & 7;
   vec4 v = which == 1 ? current : which == 2 ? texel : which == 3 ? factor : v_diffuse;
@@ -134,7 +163,31 @@ void main() {
   }
   // Direct3D compares the 8-bit alpha with the reference.
   if (alpha_test != 0 && !passes(floor(current.a * 255.0 + 0.5))) discard;
+  if (floor_grade.x != 0.0)
+    current.rgb = mix(vec3(dot(current.rgb, vec3(0.2126, 0.7152, 0.0722))), current.rgb, floor_grade.z) * floor_grade.y;
   color = current;
+  mask = vec4(float(outlined == 1), float(outlined == 2), 0.0, current.a);
+}
+)";
+
+// The lines: on each pixel just outside a channel of the mask, by how much the
+// mask covers its neighbors WIDTH pixels away.
+const char *edge_fragment_source = SHADER_HEADER R"(
+out vec4 color;
+uniform sampler2D mask;
+uniform vec4 outline[2]; // color, width in pixels (0 for no line): enemies, then players
+float line(int channel, float width) {
+  if (width <= 0.0) return 0.0;
+  vec2 size = vec2(textureSize(mask, 0));
+  float here = texelFetch(mask, ivec2(gl_FragCoord.xy), 0)[channel], near = 0.0;
+  for (int i = -1; i <= 1; ++i)
+    for (int j = -1; j <= 1; ++j)
+      near = max(near, texture(mask, (gl_FragCoord.xy + vec2(i, j) * width) / size)[channel]);
+  return clamp(near - here, 0.0, 1.0);
+}
+void main() {
+  float enemy = line(0, outline[0].a), player = line(1, outline[1].a);
+  color = vec4((enemy * outline[0].rgb + player * outline[1].rgb) / max(enemy + player, 1e-6), max(enemy, player));
 }
 )";
 
@@ -266,6 +319,65 @@ void bind_target() {
   glViewport(0, 0, t.width, t.height);
 }
 
+// The mask is the back buffer's second color attachment, made with it.
+void attach_mask(Target &back) {
+  if (!edge_program)
+    return;
+  if (!mask_texture)
+    glGenTextures(1, &mask_texture);
+  glBindTexture(GL_TEXTURE_2D, mask_texture);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, back.width, back.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glBindFramebuffer(GL_FRAMEBUFFER, back.framebuffer);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, mask_texture, 0);
+  glDrawBuffers(2, both_buffers);
+  const GLfloat zero[4] = {};
+  glClearBufferfv(GL_COLOR, 1, zero);
+}
+
+// A copy into the back buffer writes its color alone, not the mask.
+void blit_into(Target &to, const Target &from) {
+  bool masked = mask_texture && &to == &textures[0];
+  if (masked)
+    glDrawBuffers(1, both_buffers);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, from.framebuffer);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, to.framebuffer);
+  glBlitFramebuffer(0, 0, from.width, from.height, 0, 0, to.width, to.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+  if (masked)
+    glDrawBuffers(2, both_buffers);
+  bind_target();
+}
+
+// Once a frame, before it is kept, read or shown: the lines around the mask,
+// then the mask cleared for the next frame.
+void draw_outlines() {
+  Target &back = textures[0];
+  if (edged || !mask_texture || !back.framebuffer)
+    return;
+  edged = true;
+  glBindFramebuffer(GL_FRAMEBUFFER, back.framebuffer);
+  glDrawBuffers(1, both_buffers);
+  glViewport(0, 0, back.width, back.height);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+  glDisable(GL_CULL_FACE);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glBlendEquation(GL_FUNC_ADD);
+  glUseProgram(edge_program);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, mask_texture);
+  glBindSampler(0, 0);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  glDrawBuffers(2, both_buffers);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  const GLfloat zero[4] = {};
+  glClearBufferfv(GL_COLOR, 1, zero);
+  bind_target();
+}
+
 } // namespace
 
 void renderer_init() {
@@ -283,6 +395,22 @@ void renderer_init() {
   u_alpha_test = glGetUniformLocation(program, "alpha_test");
   u_alpha_ref = glGetUniformLocation(program, "alpha_ref");
   u_alpha_func = glGetUniformLocation(program, "alpha_func");
+  u_floor = glGetUniformLocation(program, "floor_grade");
+  u_outlined = glGetUniformLocation(program, "outlined");
+#ifndef __EMSCRIPTEN__
+  if (const char *grade = getenv("CRIMSON_FLOOR"))
+    floor_grade[0] = sscanf(grade, "%f,%f", &floor_grade[1], &floor_grade[2]) == 2;
+  const char *lines[2] = {getenv("CRIMSON_OUTLINE"), getenv("CRIMSON_PLAYER_OUTLINE")};
+  for (int k = 0; k < 2; ++k)
+    if (lines[k] && sscanf(lines[k], "%f,%f,%f,%f", &outline[k][0], &outline[k][1], &outline[k][2], &outline[k][3]) == 4 &&
+        !edge_program)
+      edge_program = link(present_vertex_source, edge_fragment_source);
+  if (edge_program) {
+    glUseProgram(edge_program);
+    glUniform1i(glGetUniformLocation(edge_program, "mask"), 0);
+    glUniform4fv(glGetUniformLocation(edge_program, "outline"), 2, &outline[0][0]);
+  }
+#endif
   glUseProgram(program);
   glUniform1i(glGetUniformLocation(program, "texture0"), 0);
   glUniform1i(glGetUniformLocation(program, "texture1"), 1);
@@ -349,6 +477,8 @@ void renderer_present(int window_width, int window_height) {
   Target &back = textures[0];
   if (!back.texture)
     return;
+  draw_outlines();
+  edged = false;
   Viewport v = renderer_viewport(window_width, window_height);
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   glViewport(0, 0, window_width, window_height);
@@ -380,6 +510,7 @@ Target held, anchor;
 
 // The back buffer as top-down RGBA rows.
 std::vector<unsigned char> renderer_capture(int &width, int &height) {
+  draw_outlines();
   Target &back = textures[0];
   width = back.width;
   height = back.height;
@@ -406,6 +537,8 @@ void w2c_host_frame_hold(struct w2c_host *, u32 op) {
   Target &to = op == 1 || op == 4 ? held : op == 3 ? anchor : back;
   if (!from.framebuffer)
     return;
+  if (op == 1) // the kept frame has its lines, as a paused screen shows it
+    draw_outlines();
   if (to.width != from.width || to.height != from.height || !to.framebuffer) {
     release(to);
     to.width = from.width;
@@ -413,10 +546,7 @@ void w2c_host_frame_hold(struct w2c_host *, u32 op) {
     to.flags = 1;
     allocate(to);
   }
-  glBindFramebuffer(GL_READ_FRAMEBUFFER, from.framebuffer);
-  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, to.framebuffer);
-  glBlitFramebuffer(0, 0, from.width, from.height, 0, 0, to.width, to.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-  bind_target();
+  blit_into(to, from);
 }
 void w2c_host_texture_copy(struct w2c_host *, u32 destination, u32 source) {
   Target &from = target_or_back((int)source);
@@ -430,10 +560,7 @@ void w2c_host_texture_copy(struct w2c_host *, u32 destination, u32 source) {
     to.flags = 1;
     allocate(to);
   }
-  glBindFramebuffer(GL_READ_FRAMEBUFFER, from.framebuffer);
-  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, to.framebuffer);
-  glBlitFramebuffer(0, 0, from.width, from.height, 0, 0, from.width, from.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-  bind_target();
+  blit_into(to, from);
 }
 void w2c_host_back_buffer(struct w2c_host *, u32 width, u32 height) {
   Target &back = textures[0];
@@ -442,6 +569,7 @@ void w2c_host_back_buffer(struct w2c_host *, u32 width, u32 height) {
   back.height = (int)height;
   back.flags = 1 | 2; // the back buffer is X8R8G8B8
   allocate(back);
+  attach_mask(back);
   current_target = 0;
   bind_target();
 }
@@ -470,6 +598,15 @@ void w2c_host_texture_upload(struct w2c_host *, u32 id, u32 texels) {
   }
   glBindTexture(GL_TEXTURE_2D, t.texture);
   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, t.width, t.height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+  outlined_textures.erase((int)id);
+  if (edge_program) {
+    unsigned long long hash = 14695981039346656037ull;
+    for (unsigned char byte : rgba)
+      hash = (hash ^ byte) * 1099511628211ull;
+    for (auto &sheet : outlined_sheets)
+      if (hash == sheet.hash)
+        outlined_textures[(int)id] = sheet.kind;
+  }
 }
 void w2c_host_texture_release(struct w2c_host *, u32 id) {
   auto it = textures.find((int)id);
@@ -479,6 +616,7 @@ void w2c_host_texture_release(struct w2c_host *, u32 id) {
     current_target = 0;
   release(it->second);
   textures.erase(it);
+  outlined_textures.erase((int)id);
   bind_target();
 }
 void w2c_host_render_state(struct w2c_host *, u32 state, u32 value) {
@@ -500,9 +638,9 @@ void w2c_host_set_render_target(struct w2c_host *, u32 id) {
 void w2c_host_clear(struct w2c_host *, u32 color) {
   Target &t = target_or_back(current_target);
   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-  glClearColor((color >> 16 & 255) / 255.0f, (color >> 8 & 255) / 255.0f, (color & 255) / 255.0f,
-               t.flags & 2 ? 1.0f : (color >> 24) / 255.0f);
-  glClear(GL_COLOR_BUFFER_BIT);
+  const GLfloat clear[4] = {(color >> 16 & 255) / 255.0f, (color >> 8 & 255) / 255.0f, (color & 255) / 255.0f,
+                           t.flags & 2 ? 1.0f : (color >> 24) / 255.0f};
+  glClearBufferfv(GL_COLOR, 0, clear); // the color alone, not the mask
 }
 void w2c_host_draw(struct w2c_host *, u32 primitive, u32 vertices, u32 vertex_count, u32 indices,
                    u32 primitive_count) {
@@ -541,6 +679,15 @@ void w2c_host_draw(struct w2c_host *, u32 primitive, u32 vertices, u32 vertex_co
   glUniform1i(u_alpha_test, render_states[RS_ALPHATESTENABLE] != 0);
   glUniform1f(u_alpha_ref, (float)(render_states[RS_ALPHAREF] & 255));
   glUniform1i(u_alpha_func, (GLint)render_states[RS_ALPHAFUNC]);
+  // The floor is the terrain, the one render-target texture the game draws onto
+  // the back buffer. An enemy or a player is a draw from its sheet onto the back
+  // buffer with ordinary alpha blending, which leaves out their shadows.
+  bool screen = current_target == 0 && has[0];
+  bool floor = floor_grade[0] != 0 && screen && (textures[bound[0]].flags & 1);
+  auto sheet = outlined_textures.find(bound[0]);
+  int kind = screen && sheet != outlined_textures.end() && render_states[RS_SRCBLEND] == 5 ? sheet->second : NOT_OUTLINED;
+  glUniform3f(u_floor, floor, floor_grade[1], floor_grade[2]);
+  glUniform1i(u_outlined, kind && outline[kind - 1][3] > 0 ? kind : NOT_OUTLINED);
 
   if (render_states[RS_ALPHABLENDENABLE]) {
     glEnable(GL_BLEND);
